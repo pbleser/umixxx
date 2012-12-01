@@ -4,6 +4,7 @@
 require 'sqlite3'
 require 'cri'
 require 'id3lib'
+require 'librmpd'
 
 GENRES = {
   'Techno' => %w(te k t),
@@ -19,6 +20,18 @@ GENRES = {
   'Pop' => %w(p),
   'Hip-Hop' => %w(hh),
 }
+def genre(code)
+  $_genre_map ||= begin
+                    h = {}
+                    GENRES.each do |genre, codes|
+                      codes.each do |code|
+                        h[code] = genre
+                      end
+                    end
+                    h
+                  end
+  $_genre_map.fetch(code)
+end
 
 def die(message)
   $stderr.puts "ERROR: #{message}"
@@ -515,17 +528,36 @@ def get_mpd_music_directory
   $d
 end
 
+def mpd
+  $mpd ||=
+    begin
+      mpd_conf = "#{Dir.home}/.mpd/mpd.conf"
+      port = 6600
+      addr = 'localhost'
+      File.open(mpd_conf, 'r').each_line do |line|
+        if line =~ /^\s*port\s+"?(.+?)"?\s*$/
+          port = $1.to_i
+        elsif line =~ /^\s*bind_to_address\s+"?(.+?)"?\s*$/
+          addr = $1
+        end
+      end
+      mpd = MPD.new addr, port
+      mpd.connect
+      mpd
+    end
+  $mpd
+end
+
 def get_mpd_current_file
   mpd_dir = get_mpd_music_directory
-  f = `mpc current -f '%file%'`.chomp
-  "#{mpd_dir}#{f}"
+  File.join(mpd_dir, mpd.current_song.file)
 end
 
 def tracks_for_mpc(tracks)
   mpd_dir = get_mpd_music_directory
   tracks.each do |track|
     dir = track.directory.gsub(/^#{Regexp.escape(mpd_dir)}/, '')
-    puts "#{dir}/#{track.filename}"
+    puts File.join(dir, track.filename)
   end
 end
 
@@ -902,6 +934,10 @@ begin
   $db = MixxxDatabase.new
   cli.run(ARGV)
 ensure
-  $db.close if $db
+  begin
+    $db.close if $db
+  ensure
+    $mpd.disconnect if $mpd
+  end
 end
 
