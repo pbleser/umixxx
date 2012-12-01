@@ -1,5 +1,13 @@
 #!/usr/bin/env ruby
 # vim: set ts=2 sw=2 et ai:
+#
+# Command-line frontend to the Mixxx database
+# Author: Pascal Bleser <pascal.bleser@opensuse.org>
+# Copyright (C) 2012 Pascal Bleser <pascal.bleser@opensuse.org>
+#
+# This project is released under the terms of the
+# GNU General Public License version 2 or later (GPL-2.0+):
+# https://www.gnu.org/licenses/gpl-2.0.html
 
 require 'sqlite3'
 require 'cri'
@@ -623,18 +631,7 @@ cli = begin
             file = get_mpd_current_file
             track = $db.find_track(file)
             if args.size > 0
-              genre = begin
-                        c = args[0].downcase
-                        match = nil
-                        GENRES.each do |genre, aliases|
-                          if c == genre.downcase or aliases.include? c
-                            match = genre
-                            break
-                          end
-                        end
-                        die "invalid genre \"#{c}\"" unless match
-                        match
-                      end
+              genre = genre(args[0].downcase)
               $db.set_genre(track.id, genre)
               begin
                 tag = ID3Lib::Tag.new(track.file)
@@ -690,16 +687,7 @@ cli = begin
             genre = begin
                       g = args.select{|a| a =~ /^[^\d]/}.first
                       if g
-                        g = g.downcase
-                        match = nil
-                        GENRES.each do |genre, aliases|
-                          if g == genre.downcase or aliases.include? g
-                            match = genre
-                            break
-                          end
-                        end
-                        die "invalid genre \"#{g}\"" unless match
-                        match
+                        genre(g.downcase)
                       else
                         nil
                       end
