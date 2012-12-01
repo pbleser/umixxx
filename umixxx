@@ -1,0 +1,907 @@
+#!/usr/bin/env ruby
+# vim: set ts=2 sw=2 et ai:
+
+require 'sqlite3'
+require 'cri'
+require 'id3lib'
+
+GENRES = {
+  'Techno' => %w(te k t),
+  'House' => %w(h),
+  'Deep House' => %w(dh),
+  'Trance' => %w(tr),
+  'Tech House' => %w(th),
+  'Dubstep' => %w(ds),
+  'Drum & Bass' => %w(dnb db),
+  'Electronica' => %w(e),
+  'Intro' => %w(i),
+  'Acid' => %w(a),
+  'Pop' => %w(p),
+  'Hip-Hop' => %w(hh),
+}
+
+def die(message)
+  $stderr.puts "ERROR: #{message}"
+  exit 1
+end
+
+class Track
+  attr_reader :artist, :title
+  def initialize(artist, title)
+    @artist = artist
+    @title = title
+  end
+  def to_s
+    puts "#{@artist} - #{@title}"
+  end
+  def [](name)
+    case name
+    when :artist
+      @artist
+    when :title
+      @title
+    else
+      raise "unsupported field accessor #{name}"
+    end
+  end
+  def ==(other)
+    @artist == other.artist and @title == other.title
+  end
+  def eql?(other)
+    self == other
+  end
+  def hash
+    self.to_s.hash
+  end
+end
+
+class MixxxTrack < Track
+  attr_reader :id, :directory, :filename
+  attr_accessor :samplerate, :bitrate, :bpm, :rating, :position, :genre, :comment
+  def self.from_hash(h)
+      t = MixxxTrack.new(h['id'], h['artist'], h['title'], h['directory'], h['filename'])
+      t.samplerate = h['samplerate']
+      t.bitrate = h['bitrate']
+      t.bpm = h['bpm']
+      t.rating = h['rating']
+      t.genre = h['genre']
+      t.comment = h['comment']
+      t
+  end
+  def initialize(id, artist, title, directory, filename)
+    super(artist, title)
+    @id = id
+    @directory = directory
+    @filename = filename
+  end
+  def file
+    "#{@directory}/#{@filename}"
+  end
+  def [](name)
+    case name
+    when :directory
+      @directory
+    when :filename
+      @filename
+    when :artist
+      @artist
+    when :title
+      @title
+    when :id
+      @id
+    else
+      raise "unsupported field accessor #{name}"
+    end
+  end
+  def ==(other)
+    @artist == other.artist and @title == other.title and @id == other.id
+  end
+  def hash
+    "#{@id}-#{self.to_s}".hash
+  end
+end
+
+class Playlist
+  attr_reader :id, :name, :position, :date_created, :date_modified
+  def self.from_hash(h)
+    require 'time'
+    Playlist.new h['id'], h['name'], h['position'].to_i, DateTime.parse(h['date_created']), DateTime.parse(h['date_modified'])
+  end
+  def initialize(id, name, position, date_created, date_modified)
+    @id = id
+    @name = name
+    @position = position
+    @date_created = date_created
+    @date_modified = date_modified
+  end
+  def to_s
+    @name
+  end
+  def [](s)
+    case s
+    when :id
+      @id
+    when :name
+      @name
+    when :position
+      @position
+    when :date_created
+      @date_created
+    when :date_modified
+      @date_modified
+    else
+      raise "unsupported attribute #{s}"
+    end
+  end
+end
+
+class CueFile
+  attr_reader :tracks
+  def initialize(filename)
+    @tracks = begin
+                l = []
+                last_title = nil
+                ln = 0
+                File.open(filename, 'r').each_line do |line|
+                  ln += 1
+                  case line
+                  when /^\s*TITLE\s+(.+)\s*$/
+                    die "#{file}: #{ln}: TITLE followed by TITLE" if last_title
+                    last_title = $1
+                  when /^\s*PERFORMER\s+(.+)\s*$/
+                    l << Track.new($1, last_title)
+                    last_title = nil
+                  end
+                end
+                l
+              end
+  end
+  def size
+    @tracks.size
+  end
+  def include?(track)
+    if track.is_a? Track
+      @tracks.each do |t|
+        if t == track
+          return true
+        end
+      end
+      return false
+    else
+      raise "track must be a Track, but is a #{track.class}"
+    end
+  end
+end
+
+class MixxxDatabase
+  def initialize
+    @db = SQLite3::Database.open "#{Dir.home}/.mixxx/mixxxdb.sqlite"
+    @db.results_as_hash = true
+  end
+
+  def close
+    @db.close if @db
+  end
+
+  def get_playlist_by_name(name)
+    require 'time'
+    s = @db.prepare 'SELECT * FROM Playlists WHERE hidden=0 AND name=?'
+    s.bind_params name
+    row = s.execute.next
+    Playlist.from_hash row
+  ensure
+    s.close if s
+  end
+
+  def get_playlist_by_id(id)
+    require 'time'
+    s = @db.prepare 'SELECT * FROM Playlists WHERE hidden=0 AND id=?'
+    s.bind_params id
+    row = s.execute.next
+    Playlist.from_hash row
+  ensure
+    s.close if s
+  end
+
+  def create_playlist(name)
+    pos = begin
+            s = @db.prepare 'SELECT MAX(position) AS position FROM Playlists'
+            rs = s.execute
+            row = rs.next
+            row['position']
+          ensure
+            s.close if s
+          end
+    begin
+      s = @db.prepare "INSERT INTO Playlists(name, position, hidden, date_created, date_modified, locked) VALUES(?, ?, 0, datetime('now'), datetime('now'), 0)"
+      s.bind_params name, pos + 1
+      s.execute
+    ensure
+      s.close if s
+    end
+    s = @db.prepare 'SELECT * FROM Playlists WHERE name=?'
+    s.bind_params name
+    rs = s.execute
+    row = rs.next
+    Playlist.from_hash row
+  ensure
+    s.close if s
+  end
+
+  def get_playlist_id_by_name(name)
+    s = @db.prepare 'SELECT id FROM Playlists WHERE hidden=0 AND name=?'
+    begin
+      s.bind_params name
+      row = s.execute.next
+      row['id']
+    ensure
+      s.close if s
+    end
+  end
+
+  def playlist_tracks(pid)
+    s = @db.prepare 'SELECT * FROM PlaylistTracks p INNER JOIN library l ON p.track_id=l.id JOIN track_locations tl ON l.location=tl.id WHERE p.playlist_id=? ORDER BY position'
+    s.bind_param 1, pid
+    rs = s.execute
+    l = []
+    while (row = rs.next) do
+      l << MixxxTrack.from_hash(row)
+    end
+    l
+  ensure
+    s.close if s
+  end
+
+  def list_playlists
+    s = @db.prepare 'SELECT * FROM Playlists WHERE hidden=0 ORDER BY position'
+    s.execute.map do |row|
+      Playlist.from_hash row
+    end
+  ensure
+    s.close if s
+  end
+
+  def add_to_playlist(tracks, playlist_id)
+    pos = begin
+            s = @db.prepare 'SELECT MAX(position) AS position FROM PlaylistTracks WHERE playlist_id=?'
+            s.bind_param 1, playlist_id
+            rs = s.execute
+            row = rs.next
+            row['position'] or 0
+          ensure
+            s.close if s
+          end
+
+    @db.transaction do |db|
+      tracks.each do |track|
+        track_id = if track.is_a? MixxxTrack
+                     track.id
+                   elsif track.is_a? Integer
+                     track
+                   else
+                     raise "unsupported type #{track.class}"
+                   end
+
+        begin
+          s = db.prepare "INSERT INTO PlaylistTracks(playlist_id, track_id, position, pl_datetime_added) VALUES (?, ?, ?, datetime('now'))"
+          pos += 1
+          s.bind_params playlist_id, track_id, pos
+          s.execute
+        ensure
+          s.close if s
+        end
+      end
+    end
+  end
+
+  def get_previous_playlist
+    s = @db.prepare 'SELECT * FROM Playlists WHERE hidden=0 ORDER BY date_created DESC LIMIT 2'
+    rs = s.execute
+    row = rs.next
+    row = rs.next
+    Playlist.from_hash row
+  ensure
+    s.close if s
+  end
+
+  def get_current_playlist
+    s = @db.prepare 'SELECT * FROM Playlists WHERE hidden=0 ORDER BY date_created DESC LIMIT 1'
+    rs = s.execute
+    row = rs.next
+    Playlist.from_hash row
+  ensure
+    s.close if s
+  end
+
+  def get_playlist_name(id)
+    s = @db.prepare 'SELECT name FROM Playlists WHERE id=?'
+    s.bind_param 1, id
+    rs = s.execute
+    row = rs.next
+    row['name']
+  ensure
+    s.close if s
+  end
+
+  def set_rating(track_id, rating)
+    raise "rating must be between 0 and 5" if rating < 0 or rating > 5
+    s = @db.prepare 'UPDATE library SET rating=? WHERE id=?'
+    s.bind_params rating, track_id
+    s.execute
+  ensure
+    s.close if s
+  end
+
+  def set_genre(track_id, genre)
+    s = @db.prepare 'UPDATE library SET genre=? WHERE id=?'
+    s.bind_params genre, track_id
+    s.execute
+  ensure
+    s.close if s
+  end
+
+
+  def find_track(file)
+    directory, filename = begin
+                            require 'pathname'
+                            p = Pathname.new(file)
+                            [ p.dirname.to_s, p.basename.to_s ]
+                          end
+    s = @db.prepare 'SELECT * FROM track_locations tl INNER JOIN library l ON tl.id=l.location WHERE directory=? AND filename=?'
+    s.bind_params directory, filename
+    rs = s.execute
+    row = rs.next
+    if row
+      MixxxTrack.from_hash(row)
+    else
+      die "failed to find #{file} (d=\"#{directory}\" f=\"#{filename}\")"
+    end
+  ensure
+    s.close if s
+  end
+
+  def find_playlists_for_track_id(id)
+    s = @db.prepare 'SELECT * FROM PlaylistTracks pt INNER JOIN Playlists p ON (pt.playlist_id=p.id) WHERE track_id=? AND hidden=0'
+    s.bind_params id
+    rs = s.execute
+    l = []
+    while (row = rs.next)
+      l << Playlist.from_hash(row)
+    end
+    l
+  ensure
+    s.close if s
+  end
+
+  def esc(t)
+    t.gsub /%/, '%%'
+  end
+
+  def find_library_track(q)
+    s = @db.prepare 'SELECT * FROM library WHERE artist LIKE ? OR title LIKE ?'
+    s.bind_params "%#{esc q}%", "%#{esc q}%"
+    rs = s.execute
+    l = []
+    while (row = rs.next)
+      l << MixxxTrack.from_hash(row)
+    end
+    l
+  ensure
+    s.close if s
+  end
+
+end
+
+$null_hiliter = lambda{|text, before, after| text}
+def hilite(q, text, before, after)
+  text.gsub(/(#{Regexp.escape(q)})/i, before+'\1'+after)
+end
+$null_decorator = lambda{|track| ""}
+$null_playlist_decorator = lambda{|name| ""}
+
+def rating_stars(rating, color='33;1')
+  if rating
+    "\e[#{color}m" + ("\u{2605}" * rating) + "\e[0;37m" + ("\u{2606}" * (5 - rating)) + "\e[0m"
+  else
+    nil
+  end
+end
+
+def padding(text, max)
+  diff = max - text.size
+  if diff > 0
+    diff
+  else
+    0
+  end
+end
+
+def print_track(track, playlists=nil)
+  rating = rating_stars track.rating
+  fields = {
+    Artist: [ '33;1', track.artist ],
+    Title:  [ '31;1', track.title ],
+  }
+  fields[:BPM] = [ '35;1', '%.2f' % track.bpm ] if track.bpm
+  fields[:Rating] = [ '', rating ] if rating
+  fields[:Genre] = [ '34;1', track.genre ] if track.genre
+  fields[:Comment] = ['34;1', track.comment ] if track.comment
+  fields[:Playlists] = ['', playlists.map{|p| "\e[36;1m%s\e[0m" % p.name}.join(', ') ]
+  fields[:File] = ['', '"%s"' % track.file]
+
+  mw = fields.keys.map{|f| f.to_s.size}.max + 1
+  fields.each do |k, v|
+    c = "\e[%sm" % v[0] unless v[0].empty?
+    puts "\e[30;1m#{k.to_s}\e[0;30m#{'.' * (mw - k.to_s.size)}\e[0m#{c}#{v[1]}\e[0m"
+  end
+end
+
+def print_tracks(tracks, highlight=$null_hiliter, decorator=$null_decorator)
+  mw = {}
+  %w{title artist}.map{|k| k.to_sym}.each{|s| mw[s] = 0}
+  tracks.each do |track|
+    %w{title artist}.map{|k| k.to_sym}.each do |s|
+      len = track[s].size
+      mw[s] = len if len > mw[s]
+    end
+  end
+  tracks.each do |track|
+    artist = highlight.call track.artist, "\e[31m", "\e[0;33;1m"
+    title = highlight.call track.title, "\e[31m", "\e[0;34;1m"
+    artist_pad = "\e[30;1m" + ("." * padding(track.artist, mw[:artist])) + "\e[0m"
+
+    position = if track.position and track.position > 0
+                 "\e[30;1m#{'%3d' % track.position}\e[0m "
+               else
+                 ""
+               end
+    rating = if track.rating
+               "#{rating_stars track.rating, "32;1"} "
+             else
+               ""
+             end
+    bpm = if track.bpm
+            if track.bpm > 0
+              "\e[36m#{'%3d' % track.bpm.to_i}\e[0m "
+            else
+              " " * 4
+            end
+          else
+            ""
+          end
+
+    decoration = decorator.call(track)
+    puts "#{decoration}#{position}#{rating}#{bpm}\e[33;1m#{artist}\e[0m #{artist_pad} \e[34;1m#{title}\e[0m"
+  end
+end
+
+def print_playlists(playlists, highlight=$null_hiliter, decorator=$null_playlist_decorator)
+  mw = {}
+  %w{name}.map{|k| k.to_sym}.each{|s| mw[s] = 0}
+  playlists.each do |p|
+    %w{name}.map{|k| k.to_sym}.each do |s|
+      len = p[s].size
+      mw[s] = len if len > mw[s]
+    end
+  end
+  playlists.each do |p|
+    name = highlight.call p.name, "\e[31m", "\e[0;33;1m"
+    name_pad = "\e[30;1m" + ("." * padding(p.name, mw[:name])) + "\e[0m"
+
+    position = if p.position and p.position > 0
+                 "\e[30;1m#{'%3d' % p.position}\e[0m "
+               else
+                 ""
+               end
+
+    decoration = decorator.call(p)
+
+    puts "#{decoration}#{position}\e[33;1m#{name}\e[0m #{name_pad} #{p.date_created.strftime('%Y-%m-%d')}"
+  end
+end
+
+def get_mpd_music_directory
+  $d ||= begin
+           mpd_conf = "#{Dir.home}/.mpd/mpd.conf"
+           d = nil
+           File.open(mpd_conf, 'r').each_line do |line|
+             if line =~ /^\s*music_directory\s+"?(.+?)"?\s*$/
+               return $1.gsub('~', "#{Dir.home}") + '/'
+             end
+           end
+           die "failed to find music_directory in #{mpd_conf}" unless d
+           d
+         end
+  $d
+end
+
+def get_mpd_current_file
+  mpd_dir = get_mpd_music_directory
+  f = `mpc current -f '%file%'`.chomp
+  "#{mpd_dir}#{f}"
+end
+
+def tracks_for_mpc(tracks)
+  mpd_dir = get_mpd_music_directory
+  tracks.each do |track|
+    dir = track.directory.gsub(/^#{Regexp.escape(mpd_dir)}/, '')
+    puts "#{dir}/#{track.filename}"
+  end
+end
+
+cli = begin
+        def pl(s)
+          if s =~ /^\d+$/
+            $db.get_playlist_by_id(s.to_i)
+          else
+            $db.get_playlist_by_name(s)
+          end
+        end
+
+        def pid(s)
+          if s =~ /^\d+$/
+            s.to_i
+          else
+            $db.get_playlist_id_by_name(s)
+          end
+        end
+
+        cli = Cri::Command.new_basic_root.modify do
+          name 'umixxx'
+          usage 'umixxx [options] [command] [options]'
+          summary 'manages Mixxx database'
+        end
+        def mpc_current
+          file = get_mpd_current_file
+          track = $db.find_track(file)
+          playlists = $db.find_playlists_for_track_id(track.id)
+          print_track track, playlists
+        end
+        mpd = cli.define_command do
+          name 'mpd'
+          aliases :m, :mpc
+          run do |opts, args|
+            mpc_current
+          end
+        end
+        mpd_current = mpd.define_command do
+          name 'current'
+          aliases :info, :i, :c, :cur
+          run do |opts, args|
+            mpc_current
+          end
+        end
+        mpd_comment = mpd.define_command do
+          name 'comment'
+          aliases :co
+          run do |opts, args|
+            file = get_mpd_current_file
+            track = $db.find_track(file)
+            if args.size > 0
+              raise "not implemented yet"
+            else
+              puts "\e[33;1m#{track.artist}\e[0m \e[30;1m-\e[0m \e[34;1m#{track.title}\e[0;30;1m:\e[0m \e[30;1m\u{25C6}\e[0m#{track.comment}\e[0;30;1m\u{25C6}\e[0m"
+            end
+          end
+        end
+        mpd_genre = mpd_current.define_command do
+          name 'genre'
+          aliases :g
+          run do |opts, args|
+            file = get_mpd_current_file
+            track = $db.find_track(file)
+            if args.size > 0
+              genre = begin
+                        c = args[0].downcase
+                        match = nil
+                        GENRES.each do |genre, aliases|
+                          if c == genre.downcase or aliases.include? c
+                            match = genre
+                            break
+                          end
+                        end
+                        die "invalid genre \"#{c}\"" unless match
+                        match
+                      end
+              $db.set_genre(track.id, genre)
+              begin
+                tag = ID3Lib::Tag.new(track.file)
+                tag.genre = genre
+                tag.update!
+              end
+              puts "\e[33;1m#{track.artist}\e[0m \e[30;1m-\e[0m \e[34;1m#{track.title}\e[0;30;1m:\e[0m \e[30;1m#{track.genre}\e[0m -> \e[33;1m#{genre}\e[0m"
+            else
+              puts "\e[33;1m#{track.artist}\e[0m \e[30;1m-\e[0m \e[34;1m#{track.title}\e[0;30;1m:\e[0m #{track.genre}"
+            end
+          end
+        end
+        mpd.add_command mpd_genre
+        mpd_rating = mpd_current.define_command do
+          name 'rating'
+          aliases :r
+          run do |opts, args|
+            file = get_mpd_current_file
+            track = $db.find_track(file)
+            if args.size > 0
+              rating = args[0].to_i
+              $db.set_rating(track.id, rating)
+              puts "\e[33;1m#{track.artist}\e[0m \e[30;1m-\e[0m \e[34;1m#{track.title}\e[0;30;1m:\e[0m #{rating_stars track.rating, '37'}\e[0m -> #{rating_stars rating}"
+            else
+              rating = rating_stars track.rating
+              puts "\e[33;1m#{track.artist}\e[0m \e[30;1m-\e[0m \e[34;1m#{track.title}\e[0;30;1m:\e[0m \e[33;1m#{rating}\e[0m #{track.rating}"
+            end
+          end
+        end
+        mpd.add_command mpd_rating
+
+        mpd_add_current = mpd_current.define_command do
+          name 'add-current'
+          aliases :addcurrent, :ac, :add, :a
+          option :t, :to, 'playlist to add to'
+          run do |opts, args|
+            id = if opts[:to]
+                   id = pid opts[:to]
+                 else
+                   id = $db.get_current_playlist.id
+                 end
+            file = get_mpd_current_file
+
+            rating = begin
+                       r = args.select{|a| a =~ /^\d$/ and (0..5).include? a.to_i}.first
+                       if r
+                         r.to_i
+                       else
+                         nil
+                       end
+                     end
+
+            genre = begin
+                      g = args.select{|a| a =~ /^[^\d]/}.first
+                      if g
+                        g = g.downcase
+                        match = nil
+                        GENRES.each do |genre, aliases|
+                          if g == genre.downcase or aliases.include? g
+                            match = genre
+                            break
+                          end
+                        end
+                        die "invalid genre \"#{g}\"" unless match
+                        match
+                      else
+                        nil
+                      end
+                    end
+
+
+            disp = begin
+                     prefix = get_mpd_music_directory
+                     file[(prefix.length)..-1]
+                   end
+            track = $db.find_track(file)
+            if genre
+              $db.set_genre(track.id, genre)
+              tag = ID3Lib::Tag.new(file)
+              tag.genre = args.first
+              tag.update!
+              track.genre = genre
+            end
+            if rating
+              $db.set_rating(track.id, rating)
+              track.rating = rating
+            end
+
+            $db.add_to_playlist [track], id
+            to = $db.get_playlist_name id
+            playlists = $db.find_playlists_for_track_id(track.id)
+            puts "Added current MPD track to playlist \e[36;1m#{to}\e[0m:"
+            print_track track, playlists
+          end
+        end
+        cli.add_command mpd_add_current
+
+        def list_playlists
+          print_playlists $db.list_playlists
+        end
+
+        pl = cli.define_command do
+          name 'playlists'
+          aliases :playlist, :p, :pl
+          run do |opts, args|
+            list_playlists
+          end
+        end
+        pl.define_command do
+          name 'create'
+          run do |opts, args|
+            name = if args.size == 1
+                     args[0]
+                   else
+                     die "must specify the name of the playlist to create"
+                   end
+            pl = $db.create_playlist name
+            print_playlists [pl]
+          end
+        end
+        pl.define_command do
+          name 'list'
+          aliases :l, :ls
+          run do |opts, args|
+            list_playlists
+          end
+        end
+        pl.define_command do
+          name 'show'
+          aliases :s
+          flag :m, :mpd, 'highlight currently played in mpd'
+          flag :M, :mpc, 'highlight currently played in mpd'
+          run do |opts, args|
+            id = if args.size > 0
+                   pid args[0]
+                 else
+                   $db.get_current_playlist.id
+                 end
+            tracks = $db.playlist_tracks id
+
+            decorator = if opts[:mpd] or opts[:mpc]
+                          mpdc = get_mpd_current_file
+                          lambda{|track| mpdc == track.directory+'/'+track.filename ? "\e[41;37;1m \u{25B6} \e[0m" : " " * 3}
+                        else
+                          $null_decorator
+                        end
+
+            print_tracks tracks, $null_hiliter, decorator
+          end
+        end
+        pl.define_command do
+          name 'formpc'
+          aliases :mpc
+          run do |opts, args|
+            id = if args.size > 0
+                   pid args[0]
+                 else
+                   $db.get_current_playlist.id
+                 end
+            tracks = $db.playlist_tracks id
+            tracks_for_mpc tracks
+          end
+        end
+        pl.define_command do
+          name 'current'
+          aliases :c, :cur
+          run do |opts, args|
+            print_playlists([$db.get_current_playlist])
+          end
+        end
+
+        def unplayed(args, copy, filter=true, flat=false)
+          die "must specify playlist name or id" unless args.size > 0
+          die "must specify cue file" unless args.size > 1
+
+          id = pid args[0]
+          cue = CueFile.new args[1]
+          unless flat
+            puts "Loaded #{cue.size} tracks from cue file #{args[1]}"
+          end
+          tracks = $db.playlist_tracks id
+          unplayed = tracks.reject{|t| cue.include? t}
+          unless flat
+            puts "#{unplayed.size} unplayed, #{tracks.size - unplayed.size} played"
+            puts
+          end
+
+          decorator = if args.size > 2
+                        to_id = pid args[2]
+                        to_playlist = $db.playlist_tracks to_id
+                        missing = unplayed.reject{|t| to_playlist.include? t}
+
+                        from = $db.get_playlist_name id
+                        to = $db.get_playlist_name to_id
+
+                        if copy
+                          puts "Adding #{missing.size} unplayed tracks from #{from} to #{to}"
+                          $db.add_to_playlist(missing, to_id)
+                          lambda{|track| missing.include?(track) ? "\e[44;33;1m ADDED \e[0m " : (" " * 8)}
+                        else
+                          if filter
+                            lambda{|track| missing.include?(track) ? "\e[44;33;1m UNPLAYED \e[0m " : (" " * 11)}
+                          else
+                            tracks = missing
+                            $null_decorator
+                          end
+                        end
+                      else
+                        if filter
+                          lambda{|track| unplayed.include?(track) ? "\e[40;36;1m NP \e[0m " : (" " * 5)}
+                        else
+                          tracks = unplayed
+                          $null_decorator
+                        end
+                      end
+
+          if flat
+            tracks_for_mpc tracks
+          else
+            print_tracks tracks, $null_hiliter, decorator
+          end
+        end
+
+        unplayed = pl.define_command do
+          name 'unplayed'
+          aliases :un, :up, :u
+          flag :a, :all, 'list all in playlist with marker'
+          flag :m, :mpc, 'list in mpc format'
+          flag :f, :flat, 'list in mpc format'
+          flag :M, :mpd, 'list in mpc format'
+          run do |opts, args|
+            flat = (opts[:mpc] or opts[:mpd] or opts[:flat])
+            unplayed(args, false, opts[:all], flat)
+          end
+        end
+        cli.add_command unplayed
+
+        copy_unplayed = pl.define_command do
+          name 'copy-unplayed'
+          aliases :cpu, :cu
+          run do |opts, args|
+            unplayed(args, true)
+          end
+        end
+        cli.add_command copy_unplayed
+
+        def query(q, tracks)
+          matches = tracks.select{|track| track.artist.downcase.include? q or track.title.downcase.include? q}
+          hi = lambda{|text, before, after| hilite(q, text, before, after)}
+          print_tracks matches, hi
+        end
+
+        pl.define_command do
+          name 'find'
+          aliases :f, :search, :q
+          run do |opts, args|
+            id, q = case args.size
+                    when 0
+                      die "must specify query"
+                    when 1
+                      [ $db.get_current_playlist.id, args[0].downcase ]
+                    when 2
+                      [ pid(args[0]), args[1].downcase ]
+                    else
+                      die "wrong number of arguments"
+                    end
+            query q, $db.playlist_tracks(id)
+          end
+        end
+
+        cli.define_command do
+          name 'find'
+          aliases :f, :search, :q
+          run do |opts, args|
+            tracks, q = case args.size
+                        when 0
+                          die "must specify query"
+                        when 1
+                          q = args[0].downcase
+                          [ $db.find_library_track(q), q ]
+                        when 2
+                          id = pid args[0]
+                          q = args[1].downcase
+                          [ $db.playlist_tracks(id), q ]
+                        else
+                          die "too many arguments"
+                        end
+            query q, tracks
+          end
+        end
+
+        cli
+
+      end
+
+begin
+  $db = MixxxDatabase.new
+  cli.run(ARGV)
+ensure
+  $db.close if $db
+end
+
